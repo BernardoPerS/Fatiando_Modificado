@@ -397,11 +397,13 @@ class Spline(BaseGridder):
 
     """
 
-    def __init__(self, mindist=None, damping=None, force_coords=None, engine="auto"):
+    def __init__(self, mindist=None, damping=None, force_coords=None, engine="auto", mixed_precision=False): ##  -------- LINHA ALTERADA --------  ######
         super().__init__()
         self.damping = damping
         self.force_coords = force_coords
         self.engine = engine
+        self.mixed_precision = mixed_precision ##  -------- LINHA ALTERADA --------  ######
+        self.dtype = np.float64 ##  -------- LINHA ALTERADA --------  ######
         if engine != "auto":
             warnings.warn(
                 "The 'engine' parameter of 'verde.Spline' is "
@@ -423,6 +425,7 @@ class Spline(BaseGridder):
                 stacklevel=2,
             )
 
+    #  -------- FUNÇÃO ALTERADA --------  ######
     def fit(self, coordinates, data, weights=None, dtype="float64"):
         """
         Fit the biharmonic spline to the given data.
@@ -458,11 +461,12 @@ class Spline(BaseGridder):
         # Mudando dtype dos dados de entrada com o parâmetro passado 
         if dtype is not None:
             data = np.asarray(data, dtype=dtype)
+            self.dtype = dtype
 
         # Capture the data region to use as a default when gridding.
-        self.region_ = get_region(coordinates[:2])
-        if self.force_coords is None:
-            self.force_coords_ = tuple(i.copy() for i in n_1d_arrays(coordinates, n=2))
+        self.region_ = get_region(coordinates[:2])  # -------------- PONTO DE MUDANÇA -----------
+        if self.force_coords is None: 
+            self.force_coords_ = tuple(i.copy() for i in n_1d_arrays(coordinates, n=2)) # -------------- PONTO DE MUDANÇA -----------
         else:
             self.force_coords_ = self.force_coords
 
@@ -470,9 +474,12 @@ class Spline(BaseGridder):
         jacobian = self.jacobian(coordinates[:2], self.force_coords_, dtype=data.dtype)
         
 
-        self.force_ = least_squares(jacobian, data, weights, self.damping)
+        self.force_ = least_squares(jacobian, data, weights, self.damping) # -------------- PONTO DE MUDANÇA -----------
+        print(self.force_.itemsize)
         return self
 
+    #  -------- FUNÇÃO ALTERADA --------  ###### 
+    # Adicionar a lógica de selecionar one-precision ou mixed precision
     def predict(self, coordinates):
         """
         Evaluate the estimated spline on the given set of points.
@@ -495,19 +502,39 @@ class Spline(BaseGridder):
         """
         check_is_fitted(self, ["force_"])
         shape = np.broadcast(*coordinates[:2]).shape
-        force_east, force_north = n_1d_arrays(self.force_coords_, n=2)
-        east, north = n_1d_arrays(coordinates, n=2)
-        data = np.empty(east.size, dtype=east.dtype)
-        if parse_engine(self.engine) == "numba":
-            data = predict_numba(
-                east, north, force_east, force_north, self.mindist, self.force_, data
-            )
+        # Essas variáveis ainda estão em 64 independentemente do método mixed_precision
+        force_east, force_north = n_1d_arrays(self.force_coords_, n=2) # -------------- PONTO DE MUDANÇA -----------
+        east, north = n_1d_arrays(coordinates, n=2) # -------------- PONTO DE MUDANÇA -----------
+        
+        # --- LÓGICA DE PRECISÃO MISTA ---                              #######  -------- LINHAS ALTERADAs --------  ###### 
+        if self.mixed_precision:
+            # Se ativado , criamos a matriz final que guardará o mapa em 64-bits
+            data = np.empty(east.size, dtype="float64")
+            if parse_engine(self.engine) == "numba":
+                data = predict_numba_mixed(
+                    east, north, force_east, force_north, self.mindist, self.force_, data
+                )
+            else:
+                data = predict_numpy(
+                    east, north, force_east, force_north, self.mindist, self.force_, data
+                )
         else:
-            data = predict_numpy(
-                east, north, force_east, force_north, self.mindist, self.force_, data
-            )
+            # Se desativado, o comportamento é o original herdando a precisão de 32-bits
+            data = np.empty(east.size, dtype=self.dtype)
+            if parse_engine(self.engine) == "numba":
+                data = predict_numba(
+                    east, north, force_east, force_north, self.mindist, self.force_, data
+                )
+            else:
+                data = predict_numpy(
+                    east, north, force_east, force_north, self.mindist, self.force_, data
+                )
+
+                                                                     #######  -------- LINHAS ALTERADAs --------  ###### 
+        print(f"--> [Predict finalizado] Precisão da malha de saída: {data.dtype}") # IMPRESSÃO PARA VERIFICAR O DTYPE DE SAÍDA
         return data.reshape(shape)
 
+    #  -------- FUNÇÃO ALTERADA --------  ###### 
     def jacobian(self, coordinates, force_coords, dtype="float64"):
         """
         Make the Jacobian matrix for the 2D biharmonic spline.
@@ -534,19 +561,33 @@ class Spline(BaseGridder):
             The (n_data, n_forces) Jacobian matrix.
 
         """
-        force_east, force_north = n_1d_arrays(force_coords, n=2)
-        east, north = n_1d_arrays(coordinates, n=2)
+        
+        ##  -------- LINHAS ALTERADAS --------  ######
+        np_dtype = np.dtype(dtype).type 
+
+        if self.mixed_precision: # -------------- PONTO DE MUDANÇA -----------
+            force_east, force_north = n_1d_arrays(force_coords, n=2)
+            east, north = n_1d_arrays(coordinates, n=2)
+            mindist_calc = np.float64(self.mindist)
+        else:
+            force_east, force_north = (arr.astype(dtype) for arr in n_1d_arrays(force_coords, n=2))
+            east, north = (arr.astype(dtype) for arr in n_1d_arrays(coordinates, n=2))
+            mindist_calc = np_dtype(self.mindist)
+        
+        
         jac = np.empty((east.size, force_east.size), dtype=dtype)
         if parse_engine(self.engine) == "numba":
             jac = jacobian_numba(
-                east, north, force_east, force_north, self.mindist, jac
+                east, north, force_east, force_north, mindist_calc, jac
             )
         else:
             jac = jacobian_numpy(
-                east, north, force_east, force_north, self.mindist, jac
+                east, north, force_east, force_north, mindist_calc, jac
             )
-        return jac
 
+        print(jac.itemsize)
+        return jac
+        ##  -------- LINHAS ALTERADAS --------  ######    
 
 def warn_weighted_exact_solution(spline, weights):
     """
@@ -646,6 +687,26 @@ def predict_numba(east, north, force_east, force_north, mindist, forces, result)
                 east[i] - force_east[j], north[i] - force_north[j], mindist
             )
             result[i] += green * forces[j]
+    return result
+
+
+#  -------- FUNÇÃO ADICIONADA --------  ######
+# Adicionar nova função predict_numba forçando a soma em 64 bits 
+@jit(nopython=True, parallel=True)
+def predict_numba_mixed(east, north, force_east, force_north, mindist, forces, result):
+    "Calculate the predicted data using numba to speed things up."
+    for i in numba.prange(east.size):
+
+        sum_64_bits = np.float64(0.0)
+
+        for j in range(forces.size):
+            green = greens_func_jit(
+                east[i] - force_east[j], north[i] - force_north[j], mindist
+            )
+            sum_64_bits += green * forces[j]
+        
+        result[i] = sum_64_bits
+    
     return result
 
 
